@@ -485,20 +485,34 @@ class DshMemoryMemoryProvider(MemoryProvider):
             assistant_content or "",
         ))
 
+    # 单条消息的字符上限（护栏：防止巨型压缩摘要/粘贴内容撑爆节点，
+    # 一条 1.5MB 的"会话要点"曾把召回预算吃掉一半）。
+    _MAX_MSG_CHARS = 4000
+    # 单次 session flush 的总字符上限（护栏：防止整段长对话生成超大节点）。
+    _MAX_FLUSH_CHARS = 20000
+
+    @classmethod
+    def _clip(cls, text: str, limit: int) -> str:
+        """Truncate ``text`` to ``limit`` chars, marking the omission."""
+        text = str(text)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"…[已截断，原文 {len(text)} 字符]"
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush the transcript at a real session boundary."""
         if not self._ready or not messages:
             return
-        payload = [
-            {"role": m.get("role", ""), "content": m.get("content", "")}
-            for m in messages
-            if isinstance(m, dict)
-        ]
+        parts = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "")
+            content = self._clip(m.get("content", ""), self._MAX_MSG_CHARS)
+            parts.append(f"{role}: {content}")
         # Best-effort synchronous flush on shutdown path.
         try:
-            summary = "\n".join(
-                f'{m.get("role", "")}: {m.get("content", "")}' for m in payload
-            )
+            summary = self._clip("\n".join(parts), self._MAX_FLUSH_CHARS)
             # Same as the writer path: the session triple is
             # `cg(op="session", action="note")`, not a standalone tool.
             self._call(
