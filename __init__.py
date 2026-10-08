@@ -508,8 +508,13 @@ class DshMemoryMemoryProvider(MemoryProvider):
             if not isinstance(m, dict):
                 continue
             role = m.get("role", "")
+            if role not in ("user", "assistant"):
+                continue          # never persist tool/system output
             content = self._clip(m.get("content", ""), self._MAX_MSG_CHARS)
-            parts.append(f"{role}: {content}")
+            if content.strip():
+                parts.append(f"{role}: {content}")
+        if not parts:
+            return
         # Best-effort synchronous flush on shutdown path.
         try:
             summary = self._clip("\n".join(parts), self._MAX_FLUSH_CHARS)
@@ -522,6 +527,59 @@ class DshMemoryMemoryProvider(MemoryProvider):
             )
         except Exception as exc:
             logger.debug("dsh-memory session flush failed: %s", exc)
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract insights from messages about to be compressed.
+
+        Called right before Hermes summarises the middle of the transcript.
+        Two jobs, both length-bounded so a runaway transcript can never
+        produce a giant memory node:
+
+        1. Return a short insight string that Hermes folds into its own
+           summary prompt (this is the documented contract).
+        2. Best-effort record the *dialogue* (user/assistant only — tool
+           output is dropped: it is noise for recall and bloats the store).
+        """
+        if not messages:
+            return ""
+
+        # --- 1) Build a bounded insight string for the summary prompt -----
+        excerpt = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "")
+            if role not in ("user", "assistant"):
+                continue                      # drop tool/system noise
+            text = self._clip(m.get("content", ""), 500)
+            if text.strip():
+                excerpt.append(f"{role}: {text}")
+        insight = self._clip("\n".join(excerpt[-20:]), 4000)
+
+        # --- 2) Best-effort write of the pre-compress transcript ----------
+        if self._ready:
+            try:
+                parts = []
+                for m in messages:
+                    if not isinstance(m, dict):
+                        continue
+                    role = m.get("role", "")
+                    if role not in ("user", "assistant"):
+                        continue              # never persist tool output
+                    content = self._clip(m.get("content", ""), self._MAX_MSG_CHARS)
+                    if content.strip():
+                        parts.append(f"{role}: {content}")
+                summary = self._clip("\n".join(parts), self._MAX_FLUSH_CHARS)
+                if summary.strip():
+                    self._call(
+                        "cg",
+                        {"op": "session", "action": "note", "summary": summary},
+                        timeout=30,
+                    )
+            except Exception as exc:
+                logger.debug("dsh-memory pre-compress flush failed: %s", exc)
+
+        return insight
 
     def on_memory_write(
         self,
