@@ -42,6 +42,9 @@ _POLL_S = 0.05
 
 # Retry budget for a single MCP call before giving up.
 _MAX_RETRIES = 2
+# Sentinel pushed into the writer queue at shutdown: the writer flushes
+# everything before it (FIFO) and then exits, so no turn is dropped.
+_DRAIN_SENTINEL = object()
 
 # Schemas the agent sees. Keep the surface small and read/write safe.
 _RECALL_SCHEMA = {
@@ -205,11 +208,15 @@ class _McpStdioClient:
             if self._proc is not None:
                 return True
             try:
+                # stderr is PIPEd (not DEVNULL): the MCP server reports fatal
+                # startup problems (bad token segment count, write-policy
+                # path, clearance override) ONLY on stderr and then exits.
+                # Swallowing it makes every failure look like "empty reply".
                 self._proc = subprocess.Popen(
                     self._command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     env=self._env,
                     cwd=self._cwd,
                     text=True,
@@ -220,11 +227,18 @@ class _McpStdioClient:
                 logger.debug("dsh-memory spawn failed: %s", exc)
                 self._proc = None
                 return False
+            self._stderr_buf: list = []
+            self._start_stderr_reader()
             if not self._handshake():
                 # Release the lock first: stop() also takes self._lock, so
                 # calling it while holding the lock deadlocks.
                 proc = self._proc
                 self._proc = None
+                # Surface whatever the child said before dying — this is the
+                # only clue for fail-closed startup refusals.
+                err = self._drain_stderr()
+                if err:
+                    logger.warning("dsh-memory MCP server exited at startup: %s", err)
                 if proc is not None:
                     try:
                         proc.terminate()
@@ -236,6 +250,29 @@ class _McpStdioClient:
                             pass
                 return False
             return True
+
+    def _start_stderr_reader(self) -> None:
+        """Drain the child's stderr into a bounded buffer (never blocks)."""
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        buf = self._stderr_buf
+
+        def _drain() -> None:
+            try:
+                for line in proc.stderr:
+                    buf.append(line.rstrip())
+                    del buf[:-200]      # keep the last 200 lines
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+
+    def _drain_stderr(self) -> str:
+        """Return the buffered stderr as one string (last lines win)."""
+        buf = getattr(self, "_stderr_buf", None) or []
+        return " | ".join(x for x in buf if x.strip())[-600:]
 
     def stop(self) -> None:
         with self._lock:
@@ -268,9 +305,15 @@ class _McpStdioClient:
             return False
 
     def call(self, name: str, arguments: Dict[str, Any], timeout: float = 20.0) -> Optional[str]:
-        """``tools/call``; returns the text content of the result or None."""
+        """``tools/call``; returns the text content of the result or None.
+
+        Sets ``self._last_read_error`` on failure so the retry layer can tell a
+        *slow* server (retrying only multiplies the delay) from a *dead* one
+        (reconnecting is the fix).
+        """
         with self._lock:
             if self._proc is None:
+                self._last_read_error = "no process"
                 return None
             req_id = self._id()
             try:
@@ -278,9 +321,11 @@ class _McpStdioClient:
                             "params": {"name": name, "arguments": arguments}})
             except Exception as exc:
                 logger.debug("dsh-memory send failed: %s", exc)
+                self._last_read_error = f"send failed: {exc}"
                 return None
             resp = self._read_until(lambda r: r.get("id") == req_id,
                                     timeout=timeout)
+            # _read_until() populated self._last_read_error when it returned None.
             if resp is None:
                 return None
             result = resp.get("result") or {}
@@ -303,8 +348,14 @@ class _McpStdioClient:
         silent/hung child can never wedge the caller past ``timeout`` — and so
         consecutive calls don't fight over the pipe (a fresh reader thread per
         call would steal lines from the previous one).
+
+        Records *why* it gave up in ``self._last_read_error`` so the caller can
+        tell a slow server (retry is pointless) from a dead one (restart helps)
+        instead of treating every None the same.
         """
+        self._last_read_error = ""
         if self._proc is None or self._proc.stdout is None:
+            self._last_read_error = "no process"
             return None
         self._ensure_reader()
         deadline = time.monotonic() + timeout
@@ -314,6 +365,7 @@ class _McpStdioClient:
             except queue.Empty:
                 continue
             if line is None:
+                self._last_read_error = "stdout closed (child exited)"
                 return None  # child closed stdout
             line = line.strip()
             if not line:
@@ -324,6 +376,7 @@ class _McpStdioClient:
                 continue
             if predicate(obj):
                 return obj
+        self._last_read_error = f"timeout after {timeout:.1f}s"
         return None
 
     def _ensure_reader(self) -> None:
@@ -451,7 +504,10 @@ class DshMemoryMemoryProvider(MemoryProvider):
             return self._prefetch_result
         result = self._prefetch_cache.get(query)
         if result is None:
-            result = self._call("mdcg_recall", {"query": query, "limit": 5}) or ""
+            # Read path: never retry a mere timeout (a 3x stall on a blocked
+            # server is worse than an empty recall).
+            result = self._call("mdcg_recall", {"query": query, "limit": 5},
+                                retry_on_dead=False) or ""
             self._prefetch_cache[query] = result
             # Bound the cache.
             if len(self._prefetch_cache) > 128:
@@ -620,10 +676,25 @@ class DshMemoryMemoryProvider(MemoryProvider):
     # Shutdown
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
-        self._stop_writer.set()
+        """Drain the writer's queue, then close the MCP pipe.
+
+        Order matters: setting ``_stop_writer`` first made the writer exit
+        immediately, so every turn still queued (the last few before a session
+        boundary — /reset, /new, gateway rotation) was silently dropped. The
+        sentinel proves FIFO completion: everything enqueued before it is
+        already flushed by the time the writer consumes it.
+        """
+        # 1) Ask the writer to finish, then block on the sentinel so we know
+        #    the queue is actually empty (not merely that the thread returned).
+        try:
+            self._queue.put(_DRAIN_SENTINEL)
+        except Exception:
+            pass
         if self._writer is not None:
-            self._writer.join(timeout=5)
+            self._writer.join(timeout=10)
             self._writer = None
+        self._stop_writer.set()
+        # 2) Only now is it safe to tear the pipe down.
         if self._client is not None:
             self._client.stop()
             self._client = None
@@ -696,19 +767,35 @@ class DshMemoryMemoryProvider(MemoryProvider):
             return []
         return [python, "-m", "md_cg.mcp_server"]
 
-    def _call(self, name: str, arguments: Dict[str, Any], timeout: float = 20.0) -> str:
+    def _call(self, name: str, arguments: Dict[str, Any], timeout: float = 20.0,
+              *, retry_on_dead: bool = True) -> str:
+        """Call an MCP tool, returning its text (or "" on failure).
+
+        Retries/reconnects ONLY on a dead pipe (stdout closed / send failed).
+        A *timeout* is deliberately NOT retried on read paths: a slow server
+        (e.g. blocked on a store lock) would then be hit up to 3x, each time
+        paying the handshake, turning one slow call into a 3x stall on the
+        per-turn prefetch path. Callers that must be fast pass
+        ``retry_on_dead=False``.
+        """
         if self._client is None:
             return ""
         for attempt in range(_MAX_RETRIES + 1):
             out = self._client.call(name, arguments, timeout=timeout)
             if out is not None:
                 return out
-            # Reconnect once on a dead pipe.
-            if attempt < _MAX_RETRIES:
-                logger.debug("dsh-memory retrying %s (attempt %d)", name, attempt + 1)
+            reason = getattr(self._client, "_last_read_error", "") or ""
+            dead = ("closed" in reason) or ("no process" in reason) or ("send failed" in reason)
+            if dead and retry_on_dead and attempt < _MAX_RETRIES:
+                logger.debug("dsh-memory retrying %s (dead pipe: %s)", name, reason)
                 self._client.stop()
                 if not self._client.start():
                     break
+                continue
+            # Timeout on a live process, or retries exhausted: do not mask it.
+            if reason:
+                logger.debug("dsh-memory %s failed (%s)", name, reason)
+            break
         return ""
 
     def _start_writer(self) -> None:
@@ -722,6 +809,12 @@ class DshMemoryMemoryProvider(MemoryProvider):
                     item = self._queue.get(timeout=1.0)
                 except queue.Empty:
                     continue
+                if item is _DRAIN_SENTINEL:
+                    # Drain requested: everything queued BEFORE this sentinel is
+                    # already flushed (FIFO), so it is now safe to stop. Put the
+                    # sentinel back for any later drain and exit.
+                    self._stop_writer.set()
+                    break
                 try:
                     session, user, assistant = item
                     payload = []
