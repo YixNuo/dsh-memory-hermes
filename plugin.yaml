@@ -1,5 +1,5 @@
 name: dsh-memory
-version: "0.1.1"
+version: "0.1.2"
 description: "dsh-memory (灵枢) memory provider for Hermes Agent — 跨会话自动记忆：召回、写入、白箱验证与审计，经由 dsh-memory 的 MCP stdio 服务。"
 homepage: "https://github.com/lerona1626/dsh-memory-hermes"
 license: "MIT"
