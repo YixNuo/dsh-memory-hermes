@@ -133,6 +133,69 @@ hermes memory status
 
 ---
 
+## ⚠️ 密级（clearance）机制：务必先读
+
+灵枢对每条记忆打 **sensitivity 标签**，读取时必须 `token.clearance ≥ 节点密级`：
+
+```
+public < internal < private < secret
+```
+
+**关键结论（实测验证）：**
+
+| 角色 | 密级上限 | can_admin |
+|---|---|---|
+| `designer` | **secret** | ✅ True |
+| 其余全部（record / reflect / verify / output / sustain / orchestr / guest） | **internal** | ❌ False |
+
+**也就是说：灵枢把「能读 private/secret」和「管理员权限」绑死在 `designer` 一个角色上**，
+**不存在**「能读私密但不能管理」的中间态 —— 派生子令牌也绕不过（只能收窄，
+换任何非 designer 角色都会被夹回 internal）。
+
+### 这对插件意味着什么
+
+1. **默认只读得到 `internal` 及以下**的节点
+2. 如果你用 `designer` 之类的角色**导入过 private 数据**（会话内容默认就是 private），
+   **插件用 internal token 时一条都召回不到** —— 而且**不报错**，静默过滤
+3. 想让插件读到那些数据 → 插件 token 也必须是 `designer`（**等于给它全库管理权**）
+4. 如果插件不需要管理权 → 更安全的做法是**导入时降密级为 internal**
+
+> 建议：给插件用的 token 单独签发、单独记账；并在 `.env` 里保留 `MDCG_TOKEN` 的同时，
+> 配置一份记忆库的定期备份（回滚用）。
+
+---
+
+## 导入历史对话
+
+灵枢内置 `mdcg_ingest`（`op=ingest, action=jsonl`）可批量导入会话事件，
+但**有三个坑**：
+
+1. **水位线（watermark）**：`$MDCG_ROOT/_sources.json` 记录每个来源的最大时间戳 `t`；
+   **时间戳早于水位线的事件全部跳过**。导入历史数据（时间戳很旧）会得到 `new_events: 0`。
+   → 解决：删/清 `_sources.json`，或给事件重新赋**递增的、晚于当前水位**的时间戳。
+2. **密级**：会话内容默认 `private`，写入方 token 必须 `clearance ≥ private`（即 designer），
+   否则每条都 `denied`，错误是 `写入敏感度 private 超出 clearance internal`。
+3. **格式**：必须是 DSH 会话事件结构：
+
+```jsonl
+{"type":"session","id":"xxx","cwd":"/root"}
+{"type":"user/message","time":1700000000000,"seq":1,"data":{"content":[{"type":"text","text":"..."}]}}
+{"type":"assistant/message","time":1700000001000,"seq":2,"data":{"message":{"content":[{"type":"text","text":"..."}]}}}
+```
+
+调用：
+
+```python
+cg(op="ingest", action="jsonl", path="/path/to/session.jsonl")
+# 预演（统计但不写入）：
+cg(op="ingest", action="jsonl", path="...", dry_run=True)
+```
+
+**导入前建议筛选**：会话记录里通常混有大量工具调用日志（`role=tool`、
+带 `tool_calls` 的 assistant），这些进库只会污染召回。用纯规则过滤掉即可（零 LLM 成本）。
+
+---
+
 ## 故障排查
 
 | 现象 | 处理 |
@@ -142,6 +205,10 @@ hermes memory status
 | 工具返回 `AccessDenied ... 角色 guest` | 没配 `MDCG_TOKEN`，见上面的"签发写入凭据" |
 | 工具返回 `Unknown tool: mdcg_*` | 需要 `MDCG_MCP_SURFACE=full`（插件已默认设置） |
 | 召回为空 | 记忆库还没内容；先 `mdcg_remember` 几条 |
+| **MCP 启动即退出、报"令牌格式非法"** | token 必须是**4 段**：`mdcg1.<role>.<tk_id>.<secret>`；用 `md_cg.tokens issue` 输出的**完整明文**，别截断 |
+| **记录写不进去、`denied: N`** | 密级问题，见"密级机制"一节 |
+| **导入历史得到 `new_events: 0`** | 水位线问题，见"导入历史对话"一节 |
+| `prefetch` 变慢 | 检查 MCP 子进程是否堆积（`pgrep -f md_cg.mcp_server`）；必要时重启 gateway |
 
 ---
 
