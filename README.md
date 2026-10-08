@@ -209,6 +209,7 @@ cg(op="ingest", action="jsonl", path="...", dry_run=True)
 | **记录写不进去、`denied: N`** | 密级问题，见"密级机制"一节 |
 | **导入历史得到 `new_events: 0`** | 水位线问题，见"导入历史对话"一节 |
 | `prefetch` 变慢 | 检查 MCP 子进程是否堆积（`pgrep -f md_cg.mcp_server`）；必要时重启 gateway |
+| 启动报错看不到原因 | 插件自 v0.1.5 起捕获子进程 stderr，失败时写入 `logs/errors.log`（含「令牌格式非法」「写入策略路径」等原始提示）|
 
 ---
 
