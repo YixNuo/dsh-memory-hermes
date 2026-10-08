@@ -42,6 +42,11 @@ _POLL_S = 0.05
 
 # Retry budget for a single MCP call before giving up.
 _MAX_RETRIES = 2
+# Cap on a single tool result, in characters. A broad `mdcg_search` over a
+# large store returns absurd payloads (measured: 162,830 chars for one call);
+# anything that comes back here is fed to the model, so it must be bounded.
+_MAX_RESULT_CHARS = 20000
+
 # Sentinel pushed into the writer queue at shutdown: the writer flushes
 # everything before it (FIFO) and then exits, so no turn is dropped.
 _DRAIN_SENTINEL = object()
@@ -139,7 +144,12 @@ _TOOLS: Dict[str, tuple] = {
     ),
     "mdcg_search": (
         "query",
-        lambda p, a, q: p._call("mdcg_search", {"query": q, "limit": a.get("limit", 8)}),
+        lambda p, a, q: p._call(
+            "mdcg_search",
+            # Clamp: search has no server-side default cap and a big store
+            # can return hundreds of KB for one query.
+            {"query": q, "limit": max(1, min(int(a.get("limit", 8) or 8), 50))},
+        ),
     ),
 }
 
@@ -222,12 +232,25 @@ class _McpStdioClient:
                     text=True,
                     encoding="utf-8",
                     bufsize=1,
+                    # Own process group: the MCP launcher re-execs the real
+                    # server as a CHILD of itself, so terminating only the
+                    # launcher orphans the grandchild, keeps its inherited
+                    # stderr/stdout write ends open, and the pipe never sees
+                    # EOF — which is exactly what made reader threads leak
+                    # (measured: 10 threads over 5 stop/start cycles).
+                    # killpg on this group tears the whole tree down.
+                    start_new_session=True,
                 )
             except Exception as exc:
                 logger.debug("dsh-memory spawn failed: %s", exc)
                 self._proc = None
                 return False
             self._stderr_buf: list = []
+            # Process-scoped stop signal for BOTH pipe readers (stderr + stdout):
+            # they must be retired in stop(), or each stop/start cycle leaks a
+            # thread parked on a dead descriptor.
+            self._stop_stderr = threading.Event()
+            self._stderr_thread = None
             self._start_stderr_reader()
             if not self._handshake():
                 # Release the lock first: stop() also takes self._lock, so
@@ -257,16 +280,26 @@ class _McpStdioClient:
         if proc is None or proc.stderr is None:
             return
         buf = self._stderr_buf
+        # Reuse the process-scoped stop Event created in start(); the reader
+        # must die with the process, or every stop()/start() cycle leaks one
+        # thread (measured: 10 leaked over 5 cycles).
+        stop_ev = getattr(self, "_stop_stderr", None)
+        if stop_ev is None:
+            stop_ev = threading.Event()
+            self._stop_stderr = stop_ev
 
         def _drain() -> None:
             try:
                 for line in proc.stderr:
+                    if stop_ev.is_set():
+                        break
                     buf.append(line.rstrip())
                     del buf[:-200]      # keep the last 200 lines
             except Exception:
                 pass
 
         t = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread = t
         t.start()
 
     def _drain_stderr(self) -> str:
@@ -277,16 +310,49 @@ class _McpStdioClient:
     def stop(self) -> None:
         with self._lock:
             proc, self._proc = self._proc, None
+        # Retire the readers by killing the WHOLE process group, not just the
+        # launcher: the real server is a grandchild, and while it lives the
+        # inherited pipe write-ends stay open, so the reader threads never see
+        # EOF and leak (measured: 10 over 5 cycles).
+        #
+        # Do NOT close() the pipes here: a reader blocked in read() holds the
+        # stream's internal lock, and close() waits for that same lock — that
+        # deadlocked the whole plugin (reproduced with faulthandler: main
+        # thread in stop(), both readers parked in read()).
+        stop_ev = getattr(self, "_stop_stderr", None)
+        if stop_ev is not None:
+            stop_ev.set()
         if proc is None:
             return
         try:
-            proc.terminate()
+            import signal as _signal
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
             proc.wait(timeout=3)
         except Exception:
             try:
-                proc.kill()
+                import signal as _signal
+                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        # The group is dead, so the pipes hit EOF and the readers exit on their
+        # own; a short join just reaps the thread objects.
+        for attr in ("_stderr_thread", "_reader"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try:
+                    t.join(timeout=2)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def _handshake(self) -> bool:
         """Send ``initialize`` + ``notifications/initialized`` and wait."""
@@ -333,7 +399,15 @@ class _McpStdioClient:
                 return json.dumps({"error": resp["error"]}, ensure_ascii=False)
             content = result.get("content") or []
             texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-            return "\n".join(t for t in texts if t)
+            out = "\n".join(t for t in texts if t)
+            # Cap the payload: a broad search can return hundreds of KB, and
+            # whatever comes back here lands in the model context. Truncating
+            # with an explicit marker keeps the model aware that it is partial
+            # (silently dropping the tail would look like a complete answer).
+            if len(out) > _MAX_RESULT_CHARS:
+                out = (out[:_MAX_RESULT_CHARS]
+                       + f"\n\n…[truncated: {len(out) - _MAX_RESULT_CHARS} more chars]")
+            return out
 
     def _send(self, obj: Dict[str, Any]) -> None:
         if self._proc is None or self._proc.stdin is None:
@@ -387,10 +461,13 @@ class _McpStdioClient:
         self._inbox = queue.Queue()
         proc = self._proc
         self._reader_proc = proc
+        stop_ev = getattr(self, "_stop_stderr", None)
 
         def _drain() -> None:
             try:
                 for line in proc.stdout:
+                    if stop_ev is not None and stop_ev.is_set():
+                        break
                     self._inbox.put(line)
             except Exception:
                 pass
@@ -418,6 +495,7 @@ class DshMemoryMemoryProvider(MemoryProvider):
         self._prefetch_cache: Dict[str, str] = {}
         self._prefetch_result = ""
         self._last_prefetch_at = 0.0
+        self._last_prefetch_query = ""
 
     # ------------------------------------------------------------------
     # Core lifecycle
@@ -445,6 +523,14 @@ class DshMemoryMemoryProvider(MemoryProvider):
         if not cmd:
             logger.warning("dsh-memory: %s", self.unavailable_reason() or "no server command")
             return
+        # Re-init on the SAME instance (session rotation, /reset on a cached
+        # agent) must not leak the previous child process or leave a second
+        # writer draining the same store. Tear the old pair down first.
+        if self._client is not None or self._writer is not None:
+            try:
+                self.shutdown()
+            except Exception as exc:
+                logger.debug("dsh-memory pre-reinit shutdown failed: %s", exc)
         env = dict(self._config.get("env") or {})
         # Profile-scoped default so two Hermes profiles never share a store.
         hermes_home = str(kwargs.get("hermes_home") or _hermes_home())
@@ -499,8 +585,12 @@ class DshMemoryMemoryProvider(MemoryProvider):
         if not self._ready or not query:
             return ""
         now = time.monotonic()
-        # Serve cache if fresh (< 30s) so repeated prefetches are cheap.
-        if now - self._last_prefetch_at < 30 and self._prefetch_result:
+        # The freshness shortcut only applies to a REPEAT of the same query:
+        # a global 30s window would serve the previous query's recall for a
+        # different question, i.e. inject the wrong memories.
+        if (self._last_prefetch_query == query
+                and now - self._last_prefetch_at < 30
+                and self._prefetch_result):
             return self._prefetch_result
         result = self._prefetch_cache.get(query)
         if result is None:
@@ -509,11 +599,12 @@ class DshMemoryMemoryProvider(MemoryProvider):
             result = self._call("mdcg_recall", {"query": query, "limit": 5},
                                 retry_on_dead=False) or ""
             self._prefetch_cache[query] = result
-            # Bound the cache.
+            # Bound the cache (FIFO eviction; insertion order).
             if len(self._prefetch_cache) > 128:
                 self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
         self._prefetch_result = result
         self._last_prefetch_at = now
+        self._last_prefetch_query = query
         return result
 
     def recall_status(self):
@@ -694,6 +785,22 @@ class DshMemoryMemoryProvider(MemoryProvider):
             self._writer.join(timeout=10)
             self._writer = None
         self._stop_writer.set()
+        # 1b) Drop any unconsumed sentinel so a later re-init does not let the
+        #     rebuilt writer exit immediately on a stale drain marker (which
+        #     would silently drop every turn after the restart).
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                if item is _DRAIN_SENTINEL:
+                    continue
+                # A real turn left over after the writer stopped: re-queue it so
+                # a subsequent start() flushes it rather than losing it.
+                self._queue.put(item)
+                break
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
         # 2) Only now is it safe to tear the pipe down.
         if self._client is not None:
             self._client.stop()
@@ -802,6 +909,14 @@ class DshMemoryMemoryProvider(MemoryProvider):
         """Background daemon that drains the turn queue into dsh-memory."""
         if self._writer is not None:
             return
+        # The stop Event is a one-shot latch: shutdown() sets it, and a later
+        # re-init of the SAME provider instance (session rotation, /reset on a
+        # cached agent) calls us again. Without this clear(), the rebuilt
+        # thread would see the latch already set and exit on its first loop
+        # check — silently dropping every subsequent turn (worse than the
+        # original bug, which only lost the tail). Clear it so a restart
+        # genuinely restarts.
+        self._stop_writer.clear()
 
         def _loop() -> None:
             while not self._stop_writer.is_set():
